@@ -214,15 +214,19 @@ def _safe_chat_key(ctx: AgentCtx) -> Optional[str]:
         return None
 
 
-def _recent_text_blob(chat_key: str, limit: int) -> str:
+async def _recent_text_blob(chat_key: str, limit: int) -> str:
     """取最近 limit 条消息的纯文本，拼成一个大字符串供关键词匹配。
 
     注意：注入发生在消息落库之后（run_agent 组装上下文阶段），
     所以最近消息已包含触发本回合的那条。
+
+    ⚠️ `values_list()` 返回的是惰性查询对象，**必须 await** 才能取值；
+    忘记 await 会得到 `'ValuesListQuery' object is not iterable`，
+    异常被下面的兜底吞掉后表现为「关键词规则永远不生效」。
     """
     from nekro_agent.models.db_chat_message import DBChatMessage
 
-    rows = (
+    rows = await (
         DBChatMessage.filter(chat_key=chat_key)
         .order_by("-id")
         .limit(limit)
@@ -268,7 +272,7 @@ async def inject_tool_prompts(_ctx: AgentCtx) -> str:
 
         matched_conditional: List[ToolPromptRule] = []
         if conditional_rules:
-            blob = _recent_text_blob(chat_key, config.KEYWORD_SCAN_COUNT)
+            blob = await _recent_text_blob(chat_key, config.KEYWORD_SCAN_COUNT)
             for rule in conditional_rules:
                 kws = [kw.strip().lower() for kw in rule.keywords if kw.strip()]
                 if any(kw in blob for kw in kws):

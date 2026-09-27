@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行数据与备份
+*.bak
+*.tgz
+*.tmp
+*.log
+Zone.Identifier*
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store

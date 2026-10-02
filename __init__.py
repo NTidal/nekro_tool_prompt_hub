@@ -33,6 +33,14 @@
 - 注入总量受 ``MAX_INJECT_CHARS`` 保护，超限按「全局准则 → 规则顺序」截断并记日志；
 - 只注入"事实与规范"，不注入元指令式的角色扮演要求——表达永远留给人格。
 
+已知框架行为（已在代码中兼容）
+--------------------
+NA WebUI 保存插件配置走 ``POST /api/config/batch``，该链路把嵌套字段写成
+**裸 dict** 后直接更新内存配置，**不经过 Pydantic 校验**。因此 ``config.RULES``
+的元素可能在保存后从 ``ToolPromptRule`` 退化为 ``dict``。本插件统一用
+``_rule_field()`` 取值以兼容两种形态；若你改了配置却"注入没生效"，先看日志
+有没有 ``'dict' object has no attribute`` —— 那说明取值处漏了兼容。
+
 工具搜索（v1.1.0 新增）
 --------------------
 规范再全也覆盖不了"模型临时想确认某个能力是否存在"的场景。本插件提供 AGENT 沙盒方法
@@ -74,7 +82,7 @@ plugin = NekroPlugin(
     name="工具调用提示中枢",
     module_name="nekro_tool_prompt_hub",
     description="把「何时调用工具、如何使用工具」的提示词从人格预设中剥离，以系统级规范按回合统一注入",
-    version="1.1.0",
+    version="1.1.1",
     author="NTidal",
     url="https://github.com/NTidal/nekro_tool_prompt_hub",
     i18n_name=i18n.i18n_text(
@@ -235,16 +243,36 @@ async def _recent_text_blob(chat_key: str, limit: int) -> str:
     return "\n".join(str(t) for t in rows).lower()
 
 
-def _split_rules() -> Tuple[List[ToolPromptRule], List[ToolPromptRule]]:
-    """把启用规则分成（每回合注入, 需关键词命中）。"""
-    always: List[ToolPromptRule] = []
-    conditional: List[ToolPromptRule] = []
+def _rule_field(rule, field: str, default=None):
+    """读取规则字段，兼容两种形态。
+
+    ⚠️ 为什么需要它：NA 的 WebUI 保存配置走 `POST /api/config/batch`，
+    该链路把嵌套字段写成**裸 dict** 后就更新了内存配置，不再经过 Pydantic
+    校验。于是 config.RULES 的元素会从 ToolPromptRule 退化成 dict，
+    此时 `rule.enabled` 直接抛 `'dict' object has no attribute 'enabled'`，
+    导致之后每个回合的注入都失败（直到重启才恢复）。
+    这里统一按「模型对象 / dict」两种形态取值。
+    """
+    if isinstance(rule, dict):
+        return rule.get(field, default)
+    return getattr(rule, field, default)
+
+
+def _split_rules() -> Tuple[List[Any], List[Any]]:
+    """把启用规则分成（每回合注入, 需关键词命中）。
+
+    用 _rule_field 取值，兼容 config.RULES 里混入裸 dict 的情况。
+    """
+    always: List[Any] = []
+    conditional: List[Any] = []
     for rule in config.RULES or []:
-        if not rule.enabled:
+        if not _rule_field(rule, "enabled", True):
             continue
-        if not rule.content.strip():
+        content = (_rule_field(rule, "content", "") or "").strip()
+        if not content:
             continue
-        if any(kw.strip() for kw in rule.keywords or []):
+        keywords = [str(k) for k in (_rule_field(rule, "keywords") or []) if str(k).strip()]
+        if keywords:
             conditional.append(rule)
         else:
             always.append(rule)
@@ -270,11 +298,15 @@ async def inject_tool_prompts(_ctx: AgentCtx) -> str:
 
         always_rules, conditional_rules = _split_rules()
 
-        matched_conditional: List[ToolPromptRule] = []
+        matched_conditional: List[Any] = []
         if conditional_rules:
             blob = await _recent_text_blob(chat_key, config.KEYWORD_SCAN_COUNT)
             for rule in conditional_rules:
-                kws = [kw.strip().lower() for kw in rule.keywords if kw.strip()]
+                kws = [
+                    str(kw).strip().lower()
+                    for kw in (_rule_field(rule, "keywords") or [])
+                    if str(kw).strip()
+                ]
                 if any(kw in blob for kw in kws):
                     matched_conditional.append(rule)
 
@@ -284,7 +316,9 @@ async def inject_tool_prompts(_ctx: AgentCtx) -> str:
         if config.GLOBAL_RULES.strip():
             sections.append(f"### 全局准则\n{config.GLOBAL_RULES.strip()}")
         for rule in [*always_rules, *matched_conditional]:
-            sections.append(f"### 规则：{rule.name.strip()}\n{rule.content.strip()}")
+            _name = (_rule_field(rule, "name", "") or "").strip() or "未命名规则"
+            _content = (_rule_field(rule, "content", "") or "").strip()
+            sections.append(f"### 规则：{_name}\n{_content}")
 
         if len(sections) <= (1 if config.PREAMBLE.strip() else 0):
             # 只有导语、没有任何实际规则时不注入，省 token
@@ -299,7 +333,10 @@ async def inject_tool_prompts(_ctx: AgentCtx) -> str:
             injected = injected[: config.MAX_INJECT_CHARS] + "\n（规范过长已截断）"
 
         if config.LOG_INJECT:
-            rule_names = [r.name for r in [*always_rules, *matched_conditional]]
+            rule_names = [
+                (_rule_field(r, "name", "") or "").strip() or "未命名规则"
+                for r in [*always_rules, *matched_conditional]
+            ]
             plugin.logger.info(
                 f"[tool_prompt_hub] 已注入工具调用规范 | chat={chat_key} "
                 f"| 规则 {len(rule_names)} 条 {rule_names} | {len(injected)} 字符",
